@@ -1,5 +1,7 @@
 {
     "files.associations": {
-        "null.h": "c"
+        "null.h": "c",
+        "loopback.h": "c",
+        "ip.h": "c"
     }
 }

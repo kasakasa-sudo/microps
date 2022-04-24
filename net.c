@@ -3,12 +3,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
 
 #include "util.h"
 #include "net.h"
+#include "ip.h"
+
+struct net_protocol
+{
+    struct net_protocol *next;
+    uint16_t type;
+    pthread_mutex_t mutex;
+    struct queue_head queue;
+    void (*handler)(const uint8_t *data, size_t len, struct net_device *dev);
+};
+
+struct net_protocol_queue_entry
+{
+    struct net_device *dev;
+    size_t len;
+};
 
 /* NOTE: if you want to add/delete the entries after net_run(), you need to protect these lists with a mutex. */
 static struct net_device *devices;
+static struct net_protocol *protocols;
 
 struct net_device *net_device_alloc(void)
 {
@@ -102,19 +121,135 @@ int net_device_output(struct net_device *dev, uint16_t type, const uint8_t *data
 
 int net_input_handler(uint16_t type, const uint8_t *data, size_t len, struct net_device *dev)
 {
-    debugf("dev=%s, type=0x%04x, len=%zu", dev->name, type, len);
-    debugdump(data, len);
+    struct net_protocol *proto;
+    struct net_protocol_queue_entry *entry;
+    unsigned int num;
+
+    for (proto = protocols; proto; proto = proto->next)
+    {
+        if (proto->type == type)
+        {
+            entry = calloc(1, sizeof(*entry) + len);
+            if (!entry)
+            {
+                errorf("calloc() failure");
+                return -1;
+            }
+            entry->dev = dev;
+            entry->len = len;
+            memcpy(entry + 1, data, len);
+            pthread_mutex_lock(&proto->mutex);
+            if (!queue_push(&proto->queue, entry))
+            {
+                pthread_mutex_unlock(&proto->mutex);
+                errorf("queue_push() failure");
+                free(entry);
+                return -1;
+            }
+            num = proto->queue.num;
+            pthread_mutex_unlock(&proto->mutex);
+
+            debugf("queue pushed (num:%u), dev=%s, type=0x%04x, len=%zd",
+                   num, dev->name, type, len);
+            debugdump(data, len);
+            return 0;
+        }
+    }
     return 0;
+}
+
+int net_protocol_register(uint16_t type, void (*handler)(const uint8_t *data, size_t len, struct net_device *dev))
+{
+    struct net_protocol *proto;
+
+    for (proto = protocols; proto; proto = proto->next)
+    {
+        if (type == proto->type)
+        {
+            errorf("already registered, type=0x$04x", type);
+            return -1;
+        }
+    }
+    proto = calloc(1, sizeof(*proto));
+    if (!proto)
+    {
+        errorf("calloc() failure");
+        return -1;
+    }
+    proto->type = type;
+    pthread_mutex_init(&proto->mutex, NULL);
+    proto->handler = handler;
+    proto->next = protocols;
+    protocols = proto;
+    infof("registered, type=0x%04x", type);
+    return 0;
+}
+
+#define NET_THREAD_SLEEP_TIME 1000 /* us */
+
+static pthread_t thread;
+static volatile sig_atomic_t terminate;
+
+static void *
+net_thread(void *arg)
+{
+    unsigned int count, num;
+    struct net_device *dev;
+    struct net_protocol *proto;
+    struct net_protocol_queue_entry *entry;
+
+    while (!terminate)
+    {
+        count = 0;
+        for (dev = devices; dev; dev = dev->next)
+        {
+            if (NET_DEVICE_IS_UP(dev))
+            {
+                if (dev->ops->poll)
+                {
+                    if (dev->ops->poll(dev) != -1)
+                    {
+                        count++;
+                    }
+                }
+            }
+        }
+        for (proto = protocols; proto; proto = proto->next)
+        {
+            pthread_mutex_lock(&proto->mutex);
+            entry = (struct net_protocol_queue_entry *)queue_pop(&proto->queue);
+            num = proto->queue.num;
+            pthread_mutex_unlock(&proto->mutex);
+            if (entry)
+            {
+                debugf("queue popped (num:%u), dev=%s, type=0x%04x, len=%zd",
+                       num, entry->dev->name, proto->type, entry->len);
+                debugdump((uint8_t *)(entry + 1), entry->len);
+                proto->handler((uint8_t *)(entry + 1), entry->len, entry->dev);
+                free(entry);
+                count++;
+            }
+        }
+    }
+    return NULL;
 }
 
 int net_run(void)
 {
     struct net_device *dev;
+    int err;
 
     debugf("open all devices...");
     for (dev = devices; dev; dev = dev->next)
     {
         net_device_open(dev);
+    }
+    debugf("create background thread...");
+    err = pthread_create(&thread, NULL, net_thread, NULL);
+    if (err)
+    {
+        errorf("pthread_create() failure, err=%d", err);
+        return -1;
     }
     debugf("running...");
     return 0;
@@ -123,6 +258,17 @@ int net_run(void)
 void net_shutdown(void)
 {
     struct net_device *dev;
+    int err;
+
+    debugf("terminate background thread...");
+    terminate = 1;
+    err = pthread_join(thread, NULL);
+    if (err)
+    {
+        errorf("pthread_join() faulure, err=%d", err);
+        return;
+    }
+
     for (dev = devices; dev; dev = dev->next)
     {
         net_device_close(dev);
@@ -132,5 +278,10 @@ void net_shutdown(void)
 
 int net_init(void)
 {
+    if (ip_init() == -1)
+    {
+        errorf("ip_init() failure");
+        return -1;
+    }
     return 0;
 }
